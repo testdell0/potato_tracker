@@ -1,0 +1,13 @@
+# Shared dependencies for both dbconn.py (Windows agent) and dashboardv2.py (Streamlit dashboard)
+oracledb          # Oracle DB driver (modern replacement for cx_Oracle)
+pandas            # Data handling
+openpyxl          # Excel read/write
+plotly            # Charts
+streamlit         # Dashboard UI
+
+# Agent-specific libraries
+psutil            # System monitoring
+pynput            # Keyboard/mouse activity tracking
+
+# Windows-only dependency for Win32 APIs used by the agent
+pywin32; platform_system == "Windows"
