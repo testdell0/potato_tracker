@@ -5,9 +5,18 @@
 -- Design rationale
 -- ----------------
 -- One row per (username, device_name, activity_date, app_name).
--- The tracker clubs all window-focus periods for the same app
--- within a calendar day into this single record before inserting.
--- Only records with total_seconds >= 300 (5 minutes) are pushed.
+--
+-- The tracker runs a 15-minute batch cycle:
+--   • It clubs all window-focus periods for the same app within
+--     each 15-minute window into an in-memory record.
+--   • At the end of every 15-minute window it MERGEs each app's
+--     accumulated time into this table:
+--       - First batch of the day  → INSERT a new row
+--       - Later batches same day  → UPDATE, adding seconds to the
+--         existing row (total_seconds, active_seconds, session_count)
+--         and advancing last_seen.
+--   • This means one row per (user, machine, date, app) at the end
+--     of the day, regardless of how many 15-min batches ran.
 -- ============================================================
 
 CREATE TABLE app_activity_daily (
@@ -24,12 +33,12 @@ CREATE TABLE app_activity_daily (
     system_uuid     VARCHAR2(100),
     os              VARCHAR2(400),
 
-    -- Accumulated time (seconds) across all focus windows for that app+day
+    -- Accumulated time (seconds) — grows with each 15-min MERGE
     total_seconds   NUMBER(10, 2)   NOT NULL,   -- wall-clock time in foreground
     active_seconds  NUMBER(10, 2)   NOT NULL,   -- subset where keyboard/mouse used
-    session_count   NUMBER(6)       NOT NULL,   -- number of focus windows clubbed
+    session_count   NUMBER(6)       NOT NULL,   -- total focus windows clubbed so far
 
-    -- Bookend timestamps (first & last focus window for this app on this day)
+    -- Bookend timestamps across all batches for this app on this day
     first_seen      TIMESTAMP       NOT NULL,
     last_seen       TIMESTAMP       NOT NULL,
 
@@ -37,14 +46,14 @@ CREATE TABLE app_activity_daily (
     created_at      TIMESTAMP       DEFAULT SYSTIMESTAMP NOT NULL
 );
 
--- Prevent duplicate rows for the same (user, machine, date, app).
--- If the tracker is ever restarted mid-day and replays data,
--- enforce uniqueness at the DB level.
+-- MERGE key: one row per (user, machine, date, app).
+-- The MERGE ON clause matches this constraint so each batch
+-- either inserts a new row or updates the existing one.
 ALTER TABLE app_activity_daily
     ADD CONSTRAINT uq_activity_daily
     UNIQUE (username, device_name, activity_date, app_name);
 
--- Useful indexes for dashboard queries (filter by user/date)
+-- Indexes for dashboard queries (filter by user / date / app)
 CREATE INDEX idx_aad_username      ON app_activity_daily (username);
 CREATE INDEX idx_aad_activity_date ON app_activity_daily (activity_date);
 CREATE INDEX idx_aad_app_name      ON app_activity_daily (app_name);
