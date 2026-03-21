@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Windows App Usage Logger — Daily Aggregation Mode
+Windows App Usage Logger — 15-Minute Batch Mode
 
 - Tracks active window usage (Windows-only)
-- Detects inactivity if no input for >= IDLE_THRESHOLD seconds
-- Clubs all time spent in the same application within a calendar day
-  into a single in-memory record
-- Pushes to Oracle DB only when a day ends (midnight rollover or exit)
-  AND the app's total time for that day is >= MIN_PUSH_SECONDS (5 minutes)
-- Auto-reconnect via connection pool with retries
+- Detects inactivity if no keyboard/mouse input for >= IDLE_THRESHOLD seconds
+- Clubs all focus windows for the same app within each 15-minute batch
+- Every 15 minutes, MERGEs each app's accumulated time into app_activity_daily
+  (INSERT on first occurrence that day, UPDATE to add time on subsequent batches)
+- Uses rotating log file for structured logging of every tracked activity
 """
 
 import os
@@ -19,6 +18,8 @@ import getpass
 import platform
 import threading
 import queue
+import logging
+from logging.handlers import RotatingFileHandler
 
 import psutil
 from psutil import NoSuchProcess, AccessDenied
@@ -35,34 +36,57 @@ except ImportError:
     winreg = None
 
 # --------------------------
+# Logging Setup
+# --------------------------
+LOG_FILE = os.getenv("DESKTRACKER_LOG_FILE", "desktracker.log")
+
+_log_formatter = logging.Formatter(
+    fmt="%(asctime)s [%(levelname)-8s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+_file_handler = RotatingFileHandler(
+    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+_file_handler.setFormatter(_log_formatter)
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(_log_formatter)
+
+log = logging.getLogger("desktracker")
+log.setLevel(logging.DEBUG)
+log.addHandler(_file_handler)
+log.addHandler(_console_handler)
+
+# --------------------------
 # Configuration
 # --------------------------
 POLL_SECONDS = 1
 
-# Idle detection: no keyboard/mouse input for >= IDLE_THRESHOLD seconds => inactive
+# Idle: user inactive if no input for >= IDLE_THRESHOLD seconds (min 300)
 IDLE_THRESHOLD = max(300, int(os.getenv("DESKTRACKER_IDLE_THRESHOLD", "300")))
 
-# Only push app records that accumulated >= 5 minutes (300s) of total time in a day
-MIN_PUSH_SECONDS = max(300, int(os.getenv("DESKTRACKER_MIN_PUSH_SECONDS", "300")))
+# How often (seconds) to flush accumulated app-time to the DB (default 900 = 15 min)
+BATCH_INTERVAL_SECONDS = int(os.getenv("DESKTRACKER_BATCH_INTERVAL", "900"))
 
 MAX_TOTAL_SECONDS = 8 * 60 * 60  # cap per individual window focus period
 
-# Oracle DB connection/pool settings
+# Oracle DB
 DB_USER = os.getenv("DB_USER", "your_username")
 DB_PASS = os.getenv("DB_PASS", "your_password")
 DB_DSN  = os.getenv("DB_DSN",  "your_dsn")
 
-POOL_MIN          = 1
-POOL_MAX          = 4
-POOL_INCREMENT    = 1
-TCP_CONNECT_TIMEOUT  = 5      # seconds
+# Connection pool
+POOL_MIN             = 1
+POOL_MAX             = 4
+POOL_INCREMENT       = 1
+TCP_CONNECT_TIMEOUT  = 5
 OPEN_RETRY_COUNT     = 3
-OPEN_RETRY_DELAY     = 2      # seconds
-PING_INTERVAL        = 60     # validate idle connections every 60s
+OPEN_RETRY_DELAY     = 2
+PING_INTERVAL        = 60
 PING_TIMEOUT_MS      = 5000
 POOL_WAIT_TIMEOUT_MS = 5000
 
-MAX_QUEUE_SIZE    = 1000
+# Writer thread
+MAX_QUEUE_SIZE     = 1000
 MAX_INSERT_RETRIES = 3
 
 # --------------------------
@@ -166,10 +190,10 @@ def start_pool_blocking():
                 retry_delay=OPEN_RETRY_DELAY,
                 tcp_connect_timeout=TCP_CONNECT_TIMEOUT,
             )
-            print("✅ Oracle connection pool started")
+            log.info("Oracle connection pool started")
             return
         except oracledb.Error as e:
-            print(f"❌ Pool startup failed: {e}. Retrying in 3s...")
+            log.error(f"Pool startup failed: {e}. Retrying in 3s...")
             time.sleep(3)
 
 def enqueue_row(row):
@@ -177,7 +201,7 @@ def enqueue_row(row):
     try:
         WRITE_Q.put(row, timeout=2)
     except queue.Full:
-        print("⚠️ Write queue full; dropping oldest row to keep up.")
+        log.warning("Write queue full — dropping oldest row to keep up")
         try:
             WRITE_Q.get_nowait()
             WRITE_Q.task_done()
@@ -187,46 +211,98 @@ def enqueue_row(row):
 
 def db_writer():
     """
-    Dedicated writer thread targeting app_activity_daily.
+    Dedicated writer thread.
+
+    Uses MERGE so each 15-min batch accumulates into the day's running total:
+      - First batch of the day for an app  → INSERT
+      - Subsequent batches the same day    → UPDATE (add seconds, update last_seen)
 
     Row tuple order:
         (activity_date, app_name, username, device_name, machine_guid,
          system_uuid, os, total_seconds, active_seconds, session_count,
          first_seen, last_seen)
     """
+    # Named bind variables make the MERGE readable and less error-prone
     sql = """
-        INSERT INTO app_activity_daily (
+        MERGE INTO app_activity_daily dst
+        USING (
+            SELECT
+                TO_DATE(:activity_date, 'YYYY-MM-DD')           AS activity_date,
+                :app_name                                        AS app_name,
+                :username                                        AS username,
+                :device_name                                     AS device_name,
+                :machine_guid                                    AS machine_guid,
+                :system_uuid                                     AS system_uuid,
+                :os                                              AS os,
+                :total_seconds                                   AS total_seconds,
+                :active_seconds                                  AS active_seconds,
+                :session_count                                   AS session_count,
+                TO_TIMESTAMP(:first_seen, 'YYYY-MM-DD HH24:MI:SS') AS first_seen,
+                TO_TIMESTAMP(:last_seen,  'YYYY-MM-DD HH24:MI:SS') AS last_seen
+            FROM DUAL
+        ) src
+        ON (
+            dst.activity_date = src.activity_date
+            AND dst.app_name  = src.app_name
+            AND dst.username  = src.username
+            AND dst.device_name = src.device_name
+        )
+        WHEN MATCHED THEN UPDATE SET
+            dst.total_seconds  = dst.total_seconds  + src.total_seconds,
+            dst.active_seconds = dst.active_seconds + src.active_seconds,
+            dst.session_count  = dst.session_count  + src.session_count,
+            dst.last_seen      = src.last_seen
+        WHEN NOT MATCHED THEN INSERT (
             activity_date, app_name, username, device_name, machine_guid,
             system_uuid, os, total_seconds, active_seconds, session_count,
             first_seen, last_seen
         ) VALUES (
-            TO_DATE(:1, 'YYYY-MM-DD'),
-            :2, :3, :4, :5, :6, :7, :8, :9, :10,
-            TO_TIMESTAMP(:11, 'YYYY-MM-DD HH24:MI:SS'),
-            TO_TIMESTAMP(:12, 'YYYY-MM-DD HH24:MI:SS')
+            src.activity_date, src.app_name, src.username, src.device_name,
+            src.machine_guid,  src.system_uuid, src.os,
+            src.total_seconds, src.active_seconds, src.session_count,
+            src.first_seen,    src.last_seen
         )
     """
     while True:
         row = WRITE_Q.get()
-        binds = list(row)
+        binds = {
+            "activity_date":  row[0],
+            "app_name":       row[1],
+            "username":       row[2],
+            "device_name":    row[3],
+            "machine_guid":   row[4],
+            "system_uuid":    row[5],
+            "os":             row[6],
+            "total_seconds":  row[7],
+            "active_seconds": row[8],
+            "session_count":  row[9],
+            "first_seen":     row[10],
+            "last_seen":      row[11],
+        }
         for attempt in range(MAX_INSERT_RETRIES + 1):
             try:
                 with DB_POOL.acquire() as conn:
                     with conn.cursor() as cur:
                         cur.execute(sql, binds)
                     conn.commit()
+                log.info(
+                    f"DB write OK: {row[1]} | {row[0]} | "
+                    f"total={row[7]:.0f}s active={row[8]:.0f}s sessions={row[9]}"
+                )
                 break
             except oracledb.Error as e:
                 msg = str(e)
                 if ("DPY-4011" in msg) or ("DPI-1010" in msg) or \
                         ("not connected" in msg.lower()):
                     backoff = 1.5 * (attempt + 1)
-                    print(f"⚠️ DB write retry {attempt+1}/{MAX_INSERT_RETRIES} "
-                          f"after connection error: {msg} (backing off {backoff:.1f}s)")
+                    log.warning(
+                        f"DB write retry {attempt+1}/{MAX_INSERT_RETRIES} "
+                        f"after connection error: {msg} (backing off {backoff:.1f}s)"
+                    )
                     time.sleep(backoff)
                     continue
                 else:
-                    print(f"❌ DB write failed (non-connection error): {msg}")
+                    log.error(f"DB write failed (non-connection error): {msg}")
                     break
         WRITE_Q.task_done()
 
@@ -256,51 +332,57 @@ def is_user_active():
         return (datetime.now() - last_input_time).total_seconds() < IDLE_THRESHOLD
 
 # --------------------------
-# Daily Per-App Accumulator
+# 15-Minute Batch Accumulator
 # --------------------------
-# Key:   (date_str "YYYY-MM-DD", app_name)
+# Key:   app_name  (scoped to the current batch window)
 # Value: { total_seconds, active_seconds, session_count, first_seen, last_seen }
-_daily_accumulator = {}
+_batch_accumulator = {}
 _acc_lock = threading.Lock()
 
 def accumulate(app_name, window_start, window_end, active_sec):
-    """Add one window focus period into the daily accumulator for app_name."""
-    date_str  = window_start.strftime("%Y-%m-%d")
-    total_sec = min((window_end - window_start).total_seconds(), MAX_TOTAL_SECONDS)
+    """Add one window focus period into the current batch accumulator."""
+    total_sec  = min((window_end - window_start).total_seconds(), MAX_TOTAL_SECONDS)
     active_sec = min(active_sec, total_sec)
 
-    key = (date_str, app_name)
     with _acc_lock:
-        if key not in _daily_accumulator:
-            _daily_accumulator[key] = {
+        if app_name not in _batch_accumulator:
+            _batch_accumulator[app_name] = {
                 "total_seconds":  0.0,
                 "active_seconds": 0.0,
                 "session_count":  0,
                 "first_seen":     window_start,
                 "last_seen":      window_end,
             }
-        entry = _daily_accumulator[key]
+        entry = _batch_accumulator[app_name]
         entry["total_seconds"]  += total_sec
         entry["active_seconds"] += active_sec
         entry["session_count"]  += 1
         entry["last_seen"]       = window_end
 
-def flush_entries(sysinfo, date_filter=None):
-    """
-    Push qualifying accumulator entries to the write queue.
+    log.debug(
+        f"Accumulated '{app_name}': +{total_sec:.0f}s total / "
+        f"+{active_sec:.0f}s active (window #{entry['session_count']})"
+    )
 
-    Only entries with total_seconds >= MIN_PUSH_SECONDS are pushed.
-    date_filter: "YYYY-MM-DD" string to flush a specific day, or None for all.
+def flush_batch(sysinfo, batch_date):
+    """
+    Push every app in the current batch accumulator to the write queue,
+    then clear the accumulator for the next batch window.
+
+    batch_date: datetime.date — the calendar date this batch belongs to.
     """
     with _acc_lock:
-        keys_to_flush = [
-            k for k in list(_daily_accumulator.keys())
-            if (date_filter is None or k[0] == date_filter)
-            and _daily_accumulator[k]["total_seconds"] >= MIN_PUSH_SECONDS
-        ]
-        rows_to_push = [(k, _daily_accumulator.pop(k)) for k in keys_to_flush]
+        snapshot = dict(_batch_accumulator)
+        _batch_accumulator.clear()
 
-    for (date_str, app_name), entry in rows_to_push:
+    if not snapshot:
+        log.debug("Batch flush: nothing to flush")
+        return
+
+    date_str = batch_date.strftime("%Y-%m-%d")
+    log.info(f"Batch flush: pushing {len(snapshot)} app(s) for {date_str}")
+
+    for app_name, entry in snapshot.items():
         row = (
             date_str,
             app_name,
@@ -316,45 +398,61 @@ def flush_entries(sysinfo, date_filter=None):
             entry["last_seen"].strftime("%Y-%m-%d %H:%M:%S"),
         )
         enqueue_row(row)
-        print(f"  ↑ Queued: {app_name} | {date_str} | "
-              f"total={entry['total_seconds']:.0f}s "
-              f"active={entry['active_seconds']:.0f}s "
-              f"windows={entry['session_count']}")
+        log.info(
+            f"  Queued: '{app_name}' | {date_str} | "
+            f"total={entry['total_seconds']:.0f}s "
+            f"active={entry['active_seconds']:.0f}s "
+            f"windows={entry['session_count']}"
+        )
 
 # --------------------------
 # Main Loop
 # --------------------------
 def main():
-    sysinfo      = get_system_info()
+    sysinfo = get_system_info()
+    log.info(
+        f"Tracker starting — user={sysinfo['username']} "
+        f"device={sysinfo['device_name']} "
+        f"idle_threshold={IDLE_THRESHOLD}s "
+        f"batch_interval={BATCH_INTERVAL_SECONDS}s"
+    )
+
     start_pool_blocking()
     threading.Thread(target=db_writer, daemon=True).start()
 
-    last_info    = get_active_window_info()
-    last_start   = datetime.now()
+    last_info      = get_active_window_info()
+    last_start     = datetime.now()
     active_seconds = 0
-    current_date = datetime.now().date()
+    batch_start    = datetime.now()   # marks the start of the current 15-min window
 
     try:
         while True:
             now  = datetime.now()
             info = get_active_window_info()
 
-            # ---- Day rollover: flush yesterday's accumulated data ----
-            if now.date() != current_date:
-                yesterday = current_date.strftime("%Y-%m-%d")
-                print(f"[Day rollover] Flushing data for {yesterday}...")
+            # ---- 15-minute batch flush ----
+            if (now - batch_start).total_seconds() >= BATCH_INTERVAL_SECONDS:
+                # Snapshot the in-progress window into the batch before flushing
                 if last_info:
-                    accumulate(derive_app_name(last_info["process"]),
-                               last_start, now, active_seconds)
-                flush_entries(sysinfo, date_filter=yesterday)
-                current_date   = now.date()
-                last_start     = now
-                active_seconds = 0
+                    accumulate(
+                        derive_app_name(last_info["process"]),
+                        last_start, now, active_seconds
+                    )
+                    last_start     = now
+                    active_seconds = 0
 
-            # ---- Window switch: accumulate completed focus period ----
+                flush_batch(sysinfo, batch_start.date())
+                batch_start = now   # start the next 15-min window
+
+            # ---- Window switch ----
             if info and last_info and info["hwnd"] != last_info["hwnd"]:
-                accumulate(derive_app_name(last_info["process"]),
-                           last_start, now, active_seconds)
+                old_app = derive_app_name(last_info["process"])
+                new_app = derive_app_name(info["process"]) if info else "<unknown>"
+                elapsed = (now - last_start).total_seconds()
+                log.debug(
+                    f"Window switch: '{old_app}' ({elapsed:.0f}s) → '{new_app}'"
+                )
+                accumulate(old_app, last_start, now, active_seconds)
                 last_info      = info
                 last_start     = now
                 active_seconds = 0
@@ -365,16 +463,18 @@ def main():
             time.sleep(POLL_SECONDS)
 
     except KeyboardInterrupt:
-        print("\nExiting — flushing all accumulated data...")
+        log.info("Exiting — flushing remaining batch data...")
         now = datetime.now()
         if last_info:
-            accumulate(derive_app_name(last_info["process"]),
-                       last_start, now, active_seconds)
-        flush_entries(sysinfo)   # flush all dates
+            accumulate(
+                derive_app_name(last_info["process"]),
+                last_start, now, active_seconds
+            )
+        flush_batch(sysinfo, batch_start.date())
 
         remaining = WRITE_Q.qsize()
         if remaining:
-            print(f"Waiting for {remaining} DB writes to finish...")
+            log.info(f"Waiting for {remaining} DB write(s) to finish...")
         WRITE_Q.join()
 
         _kb_listener.stop()
@@ -383,10 +483,11 @@ def main():
         if DB_POOL:
             try:
                 DB_POOL.close()
-                print("✅ DB pool closed.")
+                log.info("DB pool closed")
             except Exception as e:
-                print(f"⚠️ DB pool close error: {e}")
-        print("Bye.")
+                log.warning(f"DB pool close error: {e}")
+
+        log.info("Tracker stopped")
 
 if __name__ == "__main__":
     main()
