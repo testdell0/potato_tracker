@@ -23,36 +23,33 @@ EXPECTED_WORK_MINUTES = EXPECTED_WORK_HOURS * 60
 # --------------------------
 def load_data():
     conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+    # Reads from app_activity_daily — one row per (date, app, user) with
+    # time already clubbed across all focus windows for that day.
     query = """
-        SELECT 
+        SELECT
             username,
-            TO_CHAR(start_time, 'YYYY-MM-DD') AS date_col,
-            app_name AS app_name,
-            ROUND(duration_seconds/60, 2) AS total_minutes,
-            ROUND(active_seconds/60, 2) AS active_minutes,
-            ROUND((duration_seconds - active_seconds)/60, 2) AS idle_minutes
-        FROM app_usage_sessions
-        ORDER BY start_time
+            TO_CHAR(activity_date, 'YYYY-MM-DD')               AS date_col,
+            app_name,
+            ROUND(SUM(total_seconds)                  / 60, 2) AS total_minutes,
+            ROUND(SUM(active_seconds)                 / 60, 2) AS active_minutes,
+            ROUND(SUM(total_seconds - active_seconds) / 60, 2) AS idle_minutes,
+            SUM(session_count)                                  AS session_count
+        FROM app_activity_daily
+        GROUP BY username, activity_date, app_name
+        ORDER BY activity_date
     """
     df = pd.read_sql(query, conn)
     conn.close()
 
-    # Rename columns for display
     df.rename(columns={
-        "USERNAME": "Username",
-        "DATE_COL": "Date",
-        "APP_NAME": "App Name",
+        "USERNAME":      "Username",
+        "DATE_COL":      "Date",
+        "APP_NAME":      "App Name",
         "TOTAL_MINUTES": "Total Minutes",
-        "ACTIVE_MINUTES": "Active Minutes",
-        "IDLE_MINUTES": "Idle Minutes"
+        "ACTIVE_MINUTES":"Active Minutes",
+        "IDLE_MINUTES":  "Idle Minutes",
+        "SESSION_COUNT": "Sessions",
     }, inplace=True)
-
-    
-
-    # Replace WebViewHost with Copilot
-    df["App Name"] = df["App Name"].replace({"WebViewHost": "Copilot"})
-    df["App Name"] = df["App Name"].replace({"Olk": "Outlook.exe"})
-    df["App Name"] = df["App Name"].replace({"Pangpa": "GlobalProtect"})
 
     return df
 
@@ -88,11 +85,7 @@ background_blacklist = {
 }
 df = df[~df["App Upper"].isin(background_blacklist)]
 
-# 3) Threshold: keep only sessions with >= 10 seconds of **active** time
-# You currently have minutes in the dataframe. Convert to seconds solely for filtering OR compute using your minutes.
-df = df[df["Active Minutes"] * 60 >= 0]
-
-# 4) (Optional) Allow-list
+# 3) (Optional) Allow-list
 allow_list = {
     "MICROSOFT EDGE", "GOOGLE CHROME", "VISUAL STUDIO CODE", "EXCEL",
     "POWERPOINT", "WORD", "OUTLOOK", "MS-TEAMS", "WINDOWS TERMINAL"
@@ -162,7 +155,7 @@ with col_end:
 
 with col_app:
     app_options = ["All"] + sorted(df["App Name"].dropna().unique().tolist())
-    #selected_app = st.selectbox("Select App", app_options, index=0, key="app_select_main")
+    selected_app = st.selectbox("Select App", app_options, index=0, key="app_select_main")
 
 # ---------- Apply filters in order ----------
 filtered_df = df.copy()
@@ -172,8 +165,8 @@ if selected_user != "All":
     filtered_df = filtered_df[filtered_df["Username"] == selected_user]
 
 # App filter
-# if selected_app != "All":
-#     filtered_df = filtered_df[filtered_df["App Name"] == selected_app]
+if selected_app != "All":
+    filtered_df = filtered_df[filtered_df["App Name"] == selected_app]
 
 # Date filter (inclusive)
 if start_date > end_date:
@@ -204,7 +197,7 @@ actual_total_minutes = filtered_df["Total Minutes"].sum()
 
 
 # Workday Productivity (Active ÷ 8 hrs)
-workday_productivity = round((total_active_minutes / EXPECTED_WORK_MINUTES) * 100, 2)
+workday_productivity = min(round((total_active_minutes / EXPECTED_WORK_MINUTES) * 100, 2), 100.0)
 
 kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
 with kpi_col1:
@@ -308,13 +301,14 @@ for c in time_cols:
 
 st.subheader("📋 Detailed Productivity Data")
 
-# Option A: show ONLY the mm:ss columns (cleanest)
+# Show mm:ss formatted time columns + session count (how many focus windows were clubbed)
 st.dataframe(
     df_display[
         ["Username", "Date", "App Name",
          "Total Minutes (mm:ss)",
          "Active Minutes (mm:ss)",
-         "Idle Minutes (mm:ss)"]
+         "Idle Minutes (mm:ss)",
+         "Sessions"]
     ]
 )
 
